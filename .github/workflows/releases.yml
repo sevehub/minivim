@@ -1,0 +1,30 @@
+name: release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: write
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - { os: windows-latest, name: minivim-windows-x64.exe }
+          - { os: ubuntu-latest,  name: minivim-linux-x64 }
+          - { os: macos-latest,   name: minivim-macos-arm64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 26 }
+      - name: Build
+        shell: bash
+        run: |
+          echo '{ "main": "minivim.js", "output": "${{ matrix.name }}", "disableExperimentalSEAWarning": true }' > sea-config.json
+          node --build-sea sea-config.json
+      - name: Ad-hoc sign (macOS)
+        if: runner.os == 'macOS'
+        run: codesign --sign - ${{ matrix.name }}
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.name }}

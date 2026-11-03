@@ -1,0 +1,4 @@
+{ 
+    "main": "minivim.js", 
+    "output": "minivim.exe" 
+}
