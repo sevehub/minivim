@@ -4,7 +4,16 @@ minivim is a lightweight, single-file modal editor written in JavaScript for Nod
 
 ## Quick Start
 
-minivim requires **Node.js 16 or later**. Since browsers often block `.js` downloads, the fastest way to install it is via the shell:
+minivim requires **Node.js 16 or later** for the script version.
+
+**Windows Users:** 
+You can download the latest standalone executable directly via PowerShell:
+```powershell
+irm https://github.com/sevehub/minivim/releases/latest/download/minivim-windows-x64.exe -OutFile ~/.local/bin/minivim.exe
+```
+
+
+Since browsers often block `.js` downloads, the fastest way to install it is via the shell:
 
 **PowerShell**
 ```powershell
