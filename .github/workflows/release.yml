@@ -1,12 +1,9 @@
-
 name: release
 on:
   push:
     tags: ['v*']
-
 permissions:
   contents: write
-
 jobs:
   build:
     strategy:
@@ -18,31 +15,16 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-node@v4
-        with: 
-          node-version: 26
-
-      - name: Build Executable
+        with: { node-version: 26 }
+      - name: Build
         shell: bash
         run: |
-          # 1. Generate the SEA blob
-          echo '{ "main": "minivim.js", "output": "sea-blob" }' > sea-config.json
+          echo '{ "main": "minivim.js", "output": "${{ matrix.name }}", "disableExperimentalSEAWarning": true }' > sea-config.json
           node --build-sea sea-config.json
-
-          # 2. Copy the current node binary to the target name
-          # We use process.execPath to ensure we get the exact binary used by the runner
-          NODE_PATH=$(node -e "console.log(process.execPath)")
-          cp "$NODE_PATH" ${{ matrix.name }}
-
-          # 3. Inject the blob into the binary
-          # npx postject is the standard way to fuse the SEA blob into the node binary
-          npx postject ${{ matrix.name }} sea-blob --sentinel-fuse SEA_FUSE_sentinel
-
       - name: Ad-hoc sign (macOS)
         if: runner.os == 'macOS'
         run: codesign --sign - ${{ matrix.name }}
-
       - uses: softprops/action-gh-release@v2
         with:
           files: ${{ matrix.name }}
