@@ -1,20 +1,4 @@
 #!/usr/bin/env node
-
-/*
- * Copyright 2026 Sevetech
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
 'use strict';
 // minivim.js - a tiny vim clone with a built-in terminal pane, for PowerShell and bash scripts.
 // Zero dependencies. Usage: node minivim.js [--shell=pwsh|bash] [file ...]
@@ -35,7 +19,8 @@ const S = {
   reg: { text: [], lw: false }, undo: [], redo: [],
   anchor: null, vline: false, search: '',
   errs: [], errI: -1, syn: null, // syn: null = auto by extension
-  hud: false, keys: [], hudMax: 8, // keystroke heads-up display: on/off, recent keys, max shown
+  lastFind: null, lastIns: null, lastVis: null, sw: false,   // f/t repeat, gi position, gv selection, whole-word search
+  hint: '', hud: false, keys: [], hudMax: 8, // keystroke heads-up display: on/off, recent keys, max shown
 };
 
 const T = {
@@ -47,7 +32,8 @@ const T = {
 // ---------------------------------------------------------------- helpers
 const cur = () => S.lines[S.cy];
 const firstNB = () => cur().search(/\S|$/);
-const cls = (c) => (/\s/.test(c) ? 0 : /\w/.test(c) ? 1 : 2);
+let BIG = false;   // true while a WORD motion (W B E gE) runs: every non-blank counts as one class
+const cls = (c) => (/\s/.test(c) ? 0 : BIG || /\w/.test(c) ? 1 : 2);
 const shortCwd = () => path.basename(T.cwd) || T.cwd;
 
 function clamp() {
@@ -338,8 +324,27 @@ function motion(k, n, raw) {
     case 'e': { let p = [y, x]; for (let i = 0; i < n; i++) p = endWord(p[0], p[1]); return { y: p[0], x: p[1], inc: true }; }
     case 'G': { const ty = raw ? Math.min(L.length - 1, raw - 1) : L.length - 1; return { y: ty, x: L[ty].search(/\S|$/), lw: true }; }
     case 'gg': { const ty = raw ? Math.min(L.length - 1, raw - 1) : 0; return { y: ty, x: L[ty].search(/\S|$/), lw: true }; }
-    case 'n': case 'N': return null;
-    default: return null;
+    case '}': return paraMove(1, n);
+    case '{': return paraMove(-1, n);
+    case '%': return matchMotion();
+    case 'W': case 'B': case 'E': { BIG = true; try { return motion(k.toLowerCase(), n, raw); } finally { BIG = false; } }
+    case 'ge': case 'gE': {
+      BIG = k === 'gE';
+      try { let p = [y, x]; for (let i = 0; i < n; i++) p = prevEnd(p[0], p[1]); return { y: p[0], x: p[1], inc: true }; } finally { BIG = false; }
+    }
+    case 'g_': { const ty = Math.min(L.length - 1, y + n - 1); let e = L[ty].length - 1; while (e > 0 && /\s/.test(L[ty][e])) e--; return { y: ty, x: Math.max(0, e), inc: true }; }
+    case 'gj': return motion('j', n, raw);
+    case 'gk': return motion('k', n, raw);
+    case 'g0': return motion('0', n, raw);
+    case 'g^': return motion('^', n, raw);
+    case 'g$': return motion('$', n, raw);
+    case '_': case '+': case '-': {
+      const ty = Math.max(0, Math.min(L.length - 1, k === '-' ? y - n : k === '+' ? y + n : y + n - 1));
+      return { y: ty, x: L[ty].search(/\S|$/), lw: true };
+    }
+    case ';': return S.lastFind ? findChar(S.lastFind.t, S.lastFind.ch, n, true) : null;
+    case ',': return S.lastFind ? findChar({ f: 'F', F: 'f', t: 'T', T: 't' }[S.lastFind.t], S.lastFind.ch, n, true) : null;
+    default: return k.length === 3 && k[0] === '@' ? findChar(k[1], k[2], n, false) : null;   // '@' + f/F/t/T + char
   }
 }
 
@@ -372,6 +377,7 @@ function extract(r) {
 }
 
 function doOp(op, r) {
+  if (op.length === 2) { caseOp(op, r); return; }   // gu gU g~ g?
   S.reg = { text: extract(r), lw: !!r.lw };
   if (op === 'y') {
     S.cy = r.y1; if (!r.lw) S.cx = r.x1;
@@ -424,6 +430,266 @@ function paste(after) {
 }
 
 // ---------------------------------------------------------------- search
+// ---------------------------------------------------------------- extra motions, text objects, g commands
+// f/F/t/T. Forward f/t are inclusive, backward F/T exclusive. rep = repeat with ; or , (t/T step past the neighbour).
+function findChar(k, ch, n, rep) {
+  const l = S.lines[S.cy], fwd = k === 'f' || k === 't';
+  let x = S.cx;
+  if (rep && (k === 't' || k === 'T')) x += fwd ? 1 : -1;
+  for (let i = 0; i < n; i++) {
+    x = fwd ? l.indexOf(ch, x + 1) : (x > 0 ? l.lastIndexOf(ch, x - 1) : -1);
+    if (x < 0) return null;
+  }
+  if (k === 't') x--; else if (k === 'T') x++;
+  return { y: S.cy, x, inc: fwd };
+}
+
+// { and }: target is the blank line that ends the paragraph (or the first/last line of the buffer).
+function paraMove(dir, n) {
+  const L = S.lines, last = L.length - 1, blank = (i) => L[i].trim() === '';
+  const inb = (v) => v >= 0 && v <= last;
+  let y = S.cy;
+  for (let i = 0; i < n; i++) {
+    while (inb(y + dir) && blank(y)) y += dir;
+    while (inb(y + dir) && !blank(y)) y += dir;
+  }
+  if (dir > 0 && y === last && !blank(y)) return { y, x: L[y].length };
+  return { y, x: 0 };
+}
+
+// ge / gE: end of the previous word. An empty line counts as a word.
+function prevEnd(y, x) {
+  const L = S.lines;
+  let l = L[y];
+  if (x < l.length && cls(l[x]) !== 0) { const k = cls(l[x]); while (x >= 0 && cls(l[x]) === k) x--; }
+  for (;;) {
+    if (x < 0) {
+      if (y === 0) return [0, 0];
+      y--; l = L[y]; x = l.length - 1;
+      if (x < 0) return [y, 0];
+      continue;
+    }
+    if (cls(l[x]) !== 0) return [y, x];
+    x--;
+  }
+}
+
+// Partner of the bracket at (y, x), searching across lines; null when unmatched.
+function matchBracket(y, x) {
+  const L = S.lines, c = L[y][x];
+  const open = { '(': ')', '[': ']', '{': '}' }, close = { ')': '(', ']': '[', '}': '{' };
+  const fwd = c in open, a = fwd ? c : close[c], b = fwd ? open[c] : c, d = fwd ? 1 : -1;
+  let depth = 0, py = y, px = x;
+  for (;;) {
+    px += d;
+    while (px < 0 || px >= L[py].length) {
+      py += d;
+      if (py < 0 || py >= L.length) return null;
+      px = fwd ? 0 : L[py].length - 1;
+    }
+    const ch = L[py][px];
+    if (ch === (fwd ? a : b)) depth++;
+    else if (ch === (fwd ? b : a)) { if (depth === 0) return { y: py, x: px }; depth--; }
+  }
+}
+
+// %: jump to the match of the first bracket at or after the cursor.
+function matchMotion() {
+  const l = S.lines[S.cy];
+  let x = S.cx;
+  while (x < l.length && !'()[]{}'.includes(l[x])) x++;
+  if (x >= l.length) return null;
+  const m = matchBracket(S.cy, x);
+  return m && { y: m.y, x: m.x, inc: true };
+}
+
+// Innermost open/close pair around the cursor (cursor on a bracket counts as inside it).
+function findPair(open, close) {
+  const L = S.lines;
+  let o = null;
+  if (L[S.cy][S.cx] === open) o = { y: S.cy, x: S.cx };
+  else {
+    let py = S.cy, px = S.cx - 1, depth = 0;
+    for (;;) {
+      while (px < 0) { if (--py < 0) return null; px = L[py].length - 1; }
+      const c = L[py][px];
+      if (c === close) depth++;
+      else if (c === open) { if (depth === 0) { o = { y: py, x: px }; break; } depth--; }
+      px--;
+    }
+  }
+  let qy = o.y, qx = o.x + 1, depth = 0;
+  for (;;) {
+    while (qx >= L[qy].length) { if (++qy >= L.length) return null; qx = 0; }
+    const c = L[qy][qx];
+    if (c === open) depth++;
+    else if (c === close) { if (depth === 0) return { o, c: { y: qy, x: qx } }; depth--; }
+    qx++;
+  }
+}
+
+function bracketObj(kind, open, close) {
+  const p = findPair(open, close);
+  if (!p) return null;
+  const L = S.lines, o = p.o, c = p.c;
+  if (kind === 'a') return { y1: o.y, x1: o.x, y2: c.y, x2: c.x + 1 };
+  // a block whose brackets sit on their own lines keeps those lines (like vim's diB)
+  if (c.y > o.y && o.x + 1 >= L[o.y].length && L[c.y].slice(0, c.x).trim() === '') {
+    if (c.y === o.y + 1) return { y1: o.y, x1: L[o.y].length, y2: o.y, x2: L[o.y].length };
+    return { y1: o.y + 1, y2: c.y - 1, lw: true };
+  }
+  return { y1: o.y, x1: o.x + 1, y2: c.y, x2: c.x };
+}
+
+// i' i" i` : the quoted string around the cursor, or the next one on the line. a-variants take surrounding blanks.
+function quoteObj(kind, q) {
+  const y = S.cy, l = S.lines[y], x = S.cx, pos = [];
+  for (let i = 0; i < l.length; i++) {
+    if (l[i] === '\\') { i++; continue; }
+    if (l[i] === q) pos.push(i);
+  }
+  let pair = null;
+  for (let i = 0; i + 1 < pos.length; i += 2) {
+    if ((x >= pos[i] && x <= pos[i + 1]) || pos[i] > x) { pair = [pos[i], pos[i + 1]]; break; }
+  }
+  if (!pair) return null;
+  if (kind === 'i') return { y1: y, x1: pair[0] + 1, y2: y, x2: pair[1] };
+  let a = pair[0], b = pair[1] + 1;
+  if (/\s/.test(l[b] || '')) while (b < l.length && /\s/.test(l[b])) b++;
+  else while (a > 0 && /\s/.test(l[a - 1])) a--;
+  return { y1: y, x1: a, y2: y, x2: b };
+}
+
+function wordObj(kind, big) {
+  const y = S.cy, l = S.lines[y];
+  if (!l.length) return { y1: y, x1: 0, y2: y, x2: 0 };
+  const c = (ch) => (big ? (/\s/.test(ch) ? 0 : 1) : cls(ch));
+  const k = c(l[S.cx]);
+  let a = S.cx, b = S.cx + 1;
+  while (a > 0 && c(l[a - 1]) === k) a--;
+  while (b < l.length && c(l[b]) === k) b++;
+  if (kind === 'a') {
+    if (k !== 0) {
+      let e = b;
+      while (e < l.length && c(l[e]) === 0) e++;
+      if (e > b) b = e; else while (a > 0 && c(l[a - 1]) === 0) a--;
+    } else if (b < l.length) {
+      const k2 = c(l[b]);
+      while (b < l.length && c(l[b]) === k2) b++;
+    }
+  }
+  return { y1: y, x1: a, y2: y, x2: b };
+}
+
+function paraObj(kind) {
+  const L = S.lines, blank = (y) => L[y].trim() === '', bl = blank(S.cy);
+  let a = S.cy, b = S.cy;
+  while (a > 0 && blank(a - 1) === bl) a--;
+  while (b < L.length - 1 && blank(b + 1) === bl) b++;
+  if (kind === 'a') {
+    if (b < L.length - 1) { b++; while (b < L.length - 1 && blank(b + 1) === blank(b)) b++; }
+    else if (a > 0) { a--; while (a > 0 && blank(a - 1) === blank(a)) a--; }
+  }
+  return { y1: a, y2: b, lw: true };
+}
+
+// it / at: the innermost HTML/XML element around the cursor. Void elements, self-closing tags and comments are skipped.
+function tagObj(kind) {
+  const L = S.lines, offs = [];
+  let text = '';
+  for (let y = 0; y < L.length; y++) { offs.push(text.length); text += L[y] + '\n'; }
+  const pos = offs[S.cy] + S.cx;
+  const VOID = /^(area|base|br|col|embed|hr|img|input|link|meta|param|source|track|wbr)$/i;
+  const re = /<!--[\s\S]*?-->|<(\/?)([A-Za-z][\w:.-]*)(?:\s(?:"[^"]*"|'[^']*'|[^<>"'])*)?>/g;
+  const stack = [], pairs = [];
+  let m;
+  while ((m = re.exec(text))) {
+    if (m[0].startsWith('<!--') || m[0].endsWith('/>') || (!m[1] && VOID.test(m[2]))) continue;
+    if (!m[1]) { stack.push({ name: m[2].toLowerCase(), s: m.index, e: m.index + m[0].length }); continue; }
+    let i = stack.length - 1;
+    while (i >= 0 && stack[i].name !== m[2].toLowerCase()) i--;
+    if (i < 0) continue;
+    const o = stack[i];
+    stack.length = i;
+    pairs.push({ os: o.s, oe: o.e, cs: m.index, ce: m.index + m[0].length });
+  }
+  let best = null;
+  for (const p of pairs) if (p.os <= pos && pos < p.ce && (!best || p.ce - p.os < best.ce - best.os)) best = p;
+  if (!best) return null;
+  const toYX = (o) => { let y = 0; while (y + 1 < offs.length && offs[y + 1] <= o) y++; return { y, x: o - offs[y] }; };
+  const a = toYX(kind === 'i' ? best.oe : best.os), b = toYX(kind === 'i' ? best.cs : best.ce);
+  return { y1: a.y, x1: a.x, y2: b.y, x2: b.x };
+}
+
+// kind is 'i' (inner) or 'a' (around); ch is the object key. null when there is no such object here.
+function textObject(kind, ch) {
+  switch (ch) {
+    case 'w': return wordObj(kind, false);
+    case 'W': return wordObj(kind, true);
+    case "'": case '"': case '`': return quoteObj(kind, ch);
+    case '(': case ')': case 'b': return bracketObj(kind, '(', ')');
+    case '[': case ']': return bracketObj(kind, '[', ']');
+    case '{': case '}': case 'B': return bracketObj(kind, '{', '}');
+    case '<': case '>': return bracketObj(kind, '<', '>');
+    case 't': return tagObj(kind);
+    case 'p': return paraObj(kind);
+    default: return null;
+  }
+}
+
+// Range an operator covers for motion m. Exclusive motions that end in column 0 stop at the end of the previous
+// line, and become linewise when they also start at or before the first non-blank (d} on a whole paragraph).
+function opRange(m) {
+  const [a, b] = order({ y: S.cy, x: S.cx }, m);
+  if (m.lw) return { y1: a.y, y2: b.y, lw: true };
+  if (!m.inc && b.x === 0 && b.y > a.y) {
+    const y2 = b.y - 1;
+    if (a.x <= S.lines[a.y].search(/\S|$/)) return { y1: a.y, y2, lw: true };
+    return { y1: a.y, x1: a.x, y2, x2: S.lines[y2].length };
+  }
+  return { y1: a.y, x1: a.x, y2: b.y, x2: b.x + (m.inc ? 1 : 0) };
+}
+
+// gu gU g~ g? on a range.
+function caseOp(op, r) {
+  snap();
+  const flip = (c) => (c === c.toUpperCase() ? c.toLowerCase() : c.toUpperCase());
+  const rot = (c) => { const b = c <= 'Z' ? 65 : 97; return String.fromCharCode(((c.charCodeAt(0) - b + 13) % 26) + b); };
+  const f = op === 'gu' ? (t) => t.toLowerCase()
+    : op === 'gU' ? (t) => t.toUpperCase()
+      : op === 'g~' ? (t) => [...t].map(flip).join('')
+        : (t) => t.replace(/[A-Za-z]/g, rot);
+  const L = S.lines;
+  for (let y = r.y1; y <= r.y2; y++) {
+    const a = r.lw || y > r.y1 ? 0 : r.x1, b = r.lw || y < r.y2 ? L[y].length : r.x2;
+    L[y] = L[y].slice(0, a) + f(L[y].slice(a, b)) + L[y].slice(b);
+  }
+  S.cy = r.y1;
+  if (!r.lw) S.cx = r.x1;
+  clamp(); S.want = S.cx;
+}
+
+// * # g* g# : search for the word under (or after) the cursor; * and # match whole words only.
+function searchWord(dir, whole) {
+  const l = S.lines[S.cy], re = /\w+/g;
+  let m, w = null;
+  while ((m = re.exec(l))) if (m.index + m[0].length > S.cx) { w = m; break; }
+  if (!w) { S.msg = 'No word under cursor'; return; }
+  S.search = w[0]; S.sw = whole;
+  S.cx = w.index;
+  findNext(dir);
+}
+
+// Next occurrence of p in l at/after `from` (dir > 0) or at/before `from` (dir < 0), honouring whole-word mode.
+function occ(l, p, from, dir) {
+  let x = dir > 0 ? l.indexOf(p, from) : (from >= 0 ? l.lastIndexOf(p, from) : -1);
+  while (x >= 0) {
+    if (!S.sw || (!/\w/.test(l[x - 1] || '') && !/\w/.test(l[x + p.length] || ''))) return x;
+    x = dir > 0 ? l.indexOf(p, x + 1) : (x > 0 ? l.lastIndexOf(p, x - 1) : -1);
+  }
+  return -1;
+}
+
 function findNext(dir) {
   const p = S.search;
   if (!p) return;
@@ -432,8 +698,8 @@ function findNext(dir) {
     const y = (((S.cy + dir * i) % total) + total) % total;
     const l = L[y];
     let x;
-    if (dir > 0) x = l.indexOf(p, i === 0 ? S.cx + 1 : 0);
-    else x = i === 0 ? (S.cx > 0 ? l.lastIndexOf(p, S.cx - 1) : -1) : l.lastIndexOf(p);
+    if (dir > 0) x = occ(l, p, i === 0 ? S.cx + 1 : 0, 1);
+    else x = i === 0 ? occ(l, p, S.cx - 1, -1) : occ(l, p, l.length, -1);
     if (x >= 0) { S.cy = y; S.cx = x; S.want = x; return; }
   }
   S.msg = 'Pattern not found: ' + p;
@@ -751,8 +1017,24 @@ function termKey(k) {
 }
 
 // ---------------------------------------------------------------- ex commands
-function quit() {
-process.exit(0); }
+function quit() { process.exit(0); }
+
+// Ctrl-Q: quits like :q on a clean buffer; on a modified one it arms for 3 s, and a second Ctrl-Q quits like :q!.
+const QUIT_MSG = 'Unsaved changes: Ctrl-Q again to discard, Ctrl-S to save';
+let quitArmed = false, quitTimer = null;
+
+function disarmQuit() {
+  if (!quitArmed) return;
+  quitArmed = false; clearTimeout(quitTimer);
+  if (S.msg === QUIT_MSG) S.msg = '';
+}
+
+function ctrlQ() {
+  if (quitArmed || !anyDirty()) quit();
+  quitArmed = true; S.msg = QUIT_MSG;
+  quitTimer = setTimeout(() => { disarmQuit(); render(); }, 3000);
+  if (quitTimer.unref) quitTimer.unref();
+}
 
 function exCmd(c) {
   c = c.trim();
@@ -852,22 +1134,36 @@ function normalKey(k) {
     }
     S.count = ''; return;
   }
-  if (S.pend === 'g') {
+  if (/^[fFtT]$/.test(S.pend)) {                       // f/F/t/T waiting for its character
+    const t = S.pend;
     S.pend = '';
-    if (k === 'g') k = 'gg';
-    else if (k === 't' || k === 'T') { S.op = null; S.count = ''; bufGo(k === 't' ? (cb + 1) % B.length : (cb - 1 + B.length) % B.length); return; }
-    else { S.op = null; S.count = ''; return; }
+    if (k.length !== 1) { S.op = null; S.count = ''; return; }
+    S.lastFind = { t, ch: k }; k = '@' + t + k;
+  } else if (S.pend === 'oi' || S.pend === 'oa') {      // operator + i/a waiting for the object key
+    const kind = S.pend[1], op = S.op;
+    S.pend = ''; S.op = null; S.count = '';
+    const r = k.length === 1 ? textObject(kind, k) : null;
+    if (r) doOp(op, r); else S.msg = 'No such text object here';
+    return;
+  }
+  if (S.pend === 'g') {                                 // g + key becomes the two-character command 'gx'
+    S.pend = '';
+    if (k.length !== 1) { S.op = null; S.count = ''; return; }
+    if (!S.op && (k === 't' || k === 'T')) { S.count = ''; bufGo(k === 't' ? (cb + 1) % B.length : (cb - 1 + B.length) % B.length); return; }
+    k = 'g' + k;
   }
   if (k === 'ESC') { S.op = null; S.count = ''; S.pend = ''; return; }
   if (/^[1-9]$/.test(k) || (k === '0' && S.count)) { S.count += k; return; }
   const raw = S.count ? parseInt(S.count, 10) : 0;
   const n = raw || 1;
   if (k === 'g') { S.pend = 'g'; return; }
+  if (k === 'f' || k === 'F' || k === 't' || k === 'T') { S.pend = k; return; }
+  if (S.op && (k === 'i' || k === 'a')) { S.pend = 'o' + k; return; }
 
   if (S.op) {
     const op = S.op, tot = S.opn * n;
     S.op = null; S.count = '';
-    if (k === op) {
+    if (k === op || (op.length === 2 && k === op[1])) {   // dd, guu, gUU, g~~, g??
       const y2 = Math.min(S.lines.length - 1, S.cy + tot - 1);
       doOp(op, { y1: S.cy, y2, lw: true }); return;
     }
@@ -876,9 +1172,13 @@ function normalKey(k) {
       let p = [S.cy, S.cx];
       for (let i = 0; i < tot; i++) p = endWord(p[0], i === 0 ? p[1] - 1 : p[1]);
       m = { y: p[0], x: p[1], inc: true };
-    } else m = motion(k, tot, raw);
+    } else {
+      m = motion(k, tot, raw);
+      // dw on the last word of a line stops at the end of that line instead of joining the next one
+      if (m && (k === 'w' || k === 'W') && m.y > S.cy) m = { y: m.y - 1, x: S.lines[m.y - 1].length };
+    }
     if (!m) return;
-    doOp(op, getRange({ y: S.cy, x: S.cx }, m, m.lw, m.inc));
+    doOp(op, opRange(m));
     return;
   }
 
@@ -926,7 +1226,39 @@ function normalKey(k) {
     case '/': S.mode = 'SEARCH'; S.cmd = ''; return;
     case 'n': findNext(1); return;
     case 'N': findNext(-1); return;
-    case 'C-c': S.msg = 'Type :q to quit'; return;
+    case 'gi': {
+      snap();
+      if (S.lastIns) { S.cy = Math.min(S.lines.length - 1, S.lastIns.y); S.cx = Math.min(cur().length, S.lastIns.x); }
+      enterInsert(); return;
+    }
+    case 'gI': snap(); S.cx = 0; enterInsert(); return;
+    case 'gv':
+      if (S.lastVis) {
+        S.mode = 'VISUAL'; S.vline = S.lastVis.vl; S.anchor = { ...S.lastVis.a };
+        S.cy = Math.min(S.lines.length - 1, S.lastVis.c.y); S.cx = S.lastVis.c.x; clamp();
+      }
+      return;
+    case 'gJ':
+      if (S.cy < S.lines.length - 1) { snap(); const a = cur(); S.cx = a.length; S.lines.splice(S.cy, 2, a + S.lines[S.cy + 1]); clamp(); }
+      return;
+    case 'gu': case 'gU': case 'g~': case 'g?': S.op = k; S.opn = n; return;
+    case 'gp': case 'gP':
+      paste(k === 'gp');
+      if (S.reg.lw) { S.cy = Math.min(S.lines.length - 1, S.cy + S.reg.text.length); S.cx = 0; } else if (S.reg.text.length === 1) S.cx++;
+      clamp(); S.want = S.cx; return;
+    case 'ga': {
+      const c = cur()[S.cx];
+      S.msg = c ? `<${c}> ${c.codePointAt(0)}, Hex ${c.codePointAt(0).toString(16).padStart(2, '0')}` : 'NUL';
+      return;
+    }
+    case '*': case '#': searchWord(k === '*' ? 1 : -1, true); return;
+    case 'g*': case 'g#': searchWord(k === 'g*' ? 1 : -1, false); return;
+    case '~': {
+      const l = cur();
+      if (l.length) { const e = Math.min(l.length, S.cx + n); caseOp('g~', { y1: S.cy, x1: S.cx, y2: S.cy, x2: e }); S.cx = Math.min(l.length - 1, e); S.want = S.cx; }
+      return;
+    }
+    case 'C-c': S.msg = 'Ctrl-Q or :q to quit'; return;
     default: move(k, n, raw);
   }
 }
@@ -934,7 +1266,7 @@ function normalKey(k) {
 function insertKey(k) {
   const l = cur();
   switch (k) {
-    case 'ESC': S.mode = 'NORMAL'; S.cx = Math.max(0, S.cx - 1); clamp(); S.want = S.cx; return;
+    case 'ESC': S.lastIns = { y: S.cy, x: S.cx }; S.mode = 'NORMAL'; S.cx = Math.max(0, S.cx - 1); clamp(); S.want = S.cx; return;
     case 'ENTER': {
       const ind = l.match(/^\s*/)[0];
       S.lines.splice(S.cy, 1, l.slice(0, S.cx), ind + l.slice(S.cx));
@@ -966,21 +1298,29 @@ function insertKey(k) {
 }
 
 function visualKey(k) {
-  if (S.pend === 'g') { S.pend = ''; if (k === 'g') k = 'gg'; else return; }
+  if (/^[fFtT]$/.test(S.pend)) { const t = S.pend; S.pend = ''; if (k.length !== 1) return; S.lastFind = { t, ch: k }; k = '@' + t + k; }
+  if (S.pend === 'g') { S.pend = ''; if (k.length !== 1) return; k = 'g' + k; }
   if (k === 'ESC' || (k === 'v' && !S.vline) || (k === 'V' && S.vline)) { S.mode = 'NORMAL'; S.count = ''; return; }
   if (k === 'v') { S.vline = false; return; }
   if (k === 'V') { S.vline = true; return; }
   if (/^[1-9]$/.test(k) || (k === '0' && S.count)) { S.count += k; return; }
   if (k === 'g') { S.pend = 'g'; return; }
+  if (k === 'f' || k === 'F' || k === 't' || k === 'T') { S.pend = k; return; }
   const raw = S.count ? parseInt(S.count, 10) : 0;
   const n = raw || 1;
   S.count = '';
   if (k.length === 1 && 'dyxcDXY'.includes(k)) {
     const lw = S.vline || /[DXY]/.test(k);
     const r = getRange(S.anchor, { y: S.cy, x: S.cx }, lw, true);
+    if (!lw && S.lines[r.y2].length === 0 && r.y2 < S.lines.length - 1) { r.y2++; r.x2 = 0; }   // ending on an empty line includes its newline
     S.mode = 'NORMAL';
     doOp(k === 'x' || k === 'D' || k === 'X' ? 'd' : k.toLowerCase(), r);
     return;
+  }
+  if (k === 'gu' || k === 'gU' || k === 'g~' || k === 'g?' || k === 'u' || k === 'U' || k === '~') {
+    const op = k.length === 2 ? k : k === 'u' ? 'gu' : k === 'U' ? 'gU' : 'g~';
+    const r = getRange(S.anchor, { y: S.cy, x: S.cx }, S.vline, true);
+    S.mode = 'NORMAL'; caseOp(op, r); return;
   }
   if (k === 'o') {
     const t = { y: S.cy, x: S.cx };
@@ -1000,23 +1340,29 @@ function cmdKey(k) {
   if (k === 'ENTER') {
     const c = S.cmd, m = S.mode;
     S.cmd = ''; S.mode = 'NORMAL';
-    if (m === 'SEARCH') { if (c) S.search = c; findNext(1); } else exCmd(c);
+    if (m === 'SEARCH') { if (c) { S.search = c; S.sw = false; } findNext(1); } else exCmd(c);
     return;
   }
   if (k.length >= 1 && !/^[A-Z]{2,}$/.test(k) && !k.startsWith('C-')) S.cmd += k;
 }
 
 function onKey(k) {
+  if (!(k === 'C-q' && !(T.focus && T.open))) disarmQuit();
   if (S.mode !== 'COMMAND' && S.mode !== 'SEARCH') S.msg = '';
   if (k === 'F2') { toggleHud(); return; }
   if (S.hud && !(T.focus && T.open)) hudPush(k);   // pane keystrokes are never recorded
   if (k === 'F5' || k === 'F6') { if (S.mode === 'INSERT') { S.mode = 'NORMAL'; clamp(); } if (k === 'F6') dryRun(''); else runFile(''); return; }
   if (k === 'C-w') { if (T.open) T.focus = !T.focus; else S.msg = 'No terminal open (:term)'; return; }
   if (T.focus && T.open) return termKey(k);
+  if (k === 'C-q') { ctrlQ(); return; }
+  if (k === 'C-s') { save(S.file); return; }
   switch (S.mode) {
     case 'NORMAL': return normalKey(k);
     case 'INSERT': return insertKey(k);
-    case 'VISUAL': return visualKey(k);
+    case 'VISUAL':
+      visualKey(k);
+      if (S.mode === 'VISUAL') S.lastVis = { a: { ...S.anchor }, c: { y: S.cy, x: S.cx }, vl: S.vline };   // for gv
+      return;
     default: return cmdKey(k);
   }
 }
@@ -1283,7 +1629,7 @@ function render() {
   const left = ` ${S.mode}${S.mode === 'VISUAL' && S.vline ? ' LINE' : ''}  [${cb + 1}/${B.length}] ${S.file || "[No Name]"}${S.dirty ? ' [+]' : ''}`;
   const right = `${S.count}${S.op || ''}  ${S.cy + 1}:${S.cx + 1}  ${Math.round(((S.cy + 1) / S.lines.length) * 100)}% `;
   rows.push('\x1b[7m' + (left + ' '.repeat(Math.max(1, C - left.length - right.length)) + right).slice(0, C) + '\x1b[0m');
-  const base = (S.mode === 'COMMAND' ? ':' + S.cmd : S.mode === 'SEARCH' ? '/' + S.cmd : S.msg).slice(0, C - 1);
+  const base = (S.mode === 'COMMAND' ? ':' + S.cmd : S.mode === 'SEARCH' ? '/' + S.cmd : S.msg || S.hint).slice(0, C - 1);
   rows.push(S.hud ? withHud(base, C) : base);
 
   let cr, cc;
@@ -1312,9 +1658,12 @@ function start() {
   if (sh) T.shell = sh.slice(8);
   const files = args.filter((a) => !a.startsWith('--'));
   if (files.length) { load(files[0]); if (!T.shell) T.shell = fileKind(); for (const f of files.slice(1)) openFile(f); bufGo(0); }
-  else S.msg = 'minivim - :q quit  :w save  F5/:run script  F6 dry run  :%!cmd filter  :term  Ctrl-W focus';
+  S.hint = 'Ctrl-Q to quit';
+  const hintTimer = setTimeout(() => { S.hint = ''; render(); }, 5000);   // single one-shot timer
+  if (hintTimer.unref) hintTimer.unref();
   out.write('\x1b[?1049h');
   inp.setRawMode(true);
+  if (!inp.isRaw) { cleanup(); console.error('minivim could not switch the terminal to raw mode (Ctrl-Q needs it)'); process.exit(1); }
   inp.setEncoding('utf8');
   inp.resume();
   inp.on('data', (d) => {
@@ -1330,6 +1679,3 @@ function start() {
 }
 
 start();
-
-
-
