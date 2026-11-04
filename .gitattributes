@@ -1,0 +1,2 @@
+# Check text files out with LF everywhere, so shell scripts (tests/pty.sh) and minivim.js behave the same on Windows.
+* text=auto eol=lf
